@@ -109,32 +109,6 @@ private[spark] class KubernetesClusterSchedulerBackend(
                             "mountPath": "/work-dir"
                         }
                     ]
-                },
-                {
-                    "name": "distro-fetch",
-                    "image": "busybox",
-                    "command": ["wget", "-O", "/work-dir/spark.tgz", "$sparkDistUri"],
-                    "volumeMounts": [
-                        {
-                            "name": "workdir",
-                            "mountPath": "/work-dir"
-                        }
-                    ]
-                },
-                {
-                    "name": "setup",
-                    "image": "$sparkDriverImage",
-                    "command": ["./install.sh"],
-                    "volumeMounts": [
-                        {
-                            "name": "workdir",
-                            "mountPath": "/work-dir"
-                        },
-                        {
-                            "name": "opt",
-                            "mountPath": "/opt"
-                        }
-                    ]
                 }
             ]""")
 
@@ -149,8 +123,9 @@ private[spark] class KubernetesClusterSchedulerBackend(
       .endMetadata()
       .withNewSpec()
       .withRestartPolicy("OnFailure")
+
       .addNewContainer().withName("spark-executor").withImage(sparkDriverImage)
-      .withImagePullPolicy("Always")
+      .withImagePullPolicy("IfNotPresent")
       .withCommand("/opt/spark/bin/spark-class")
       .withArgs("org.apache.spark.executor.CoarseGrainedExecutorBackend",
         "--driver-url", s"$driverURL",
@@ -163,19 +138,11 @@ private[spark] class KubernetesClusterSchedulerBackend(
       .withName("workdir")
       .withMountPath("/work-dir")
       .endVolumeMount()
-      .addNewVolumeMount()
-      .withName("opt")
-      .withMountPath("/opt")
-      .endVolumeMount()
       .endContainer()
+
       .withVolumes()
       .addNewVolume()
       .withName("workdir")
-      .withNewEmptyDir()
-      .endEmptyDir()
-      .endVolume()
-      .addNewVolume()
-      .withName("opt")
       .withNewEmptyDir()
       .endEmptyDir()
       .endVolume()
