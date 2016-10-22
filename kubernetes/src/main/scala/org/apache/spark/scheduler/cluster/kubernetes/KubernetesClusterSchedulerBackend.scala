@@ -97,29 +97,12 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   def createExecutorPod(executorNum: Int): String = {
     // create a single k8s executor pod.
-    var annotationMap = Map(
-      "pod.beta.kubernetes.io/init-containers" -> raw"""[
-                {
-                    "name": "client-fetch",
-                    "image": "busybox",
-                    "command": ["wget", "-O", "/work-dir/client.jar", "$clientJarUri"],
-                    "volumeMounts": [
-                        {
-                            "name": "workdir",
-                            "mountPath": "/work-dir"
-                        }
-                    ]
-                }
-            ]""")
-
-
     val labelMap = Map("type" -> "spark-executor")
     val podName = s"$sparkExecutorName-$executorNum"
     var pod = new PodBuilder()
       .withNewMetadata()
       .withLabels(labelMap.asJava)
       .withName(podName)
-      .withAnnotations(annotationMap.asJava)
       .endMetadata()
       .withNewSpec()
       .withRestartPolicy("OnFailure")
@@ -133,24 +116,12 @@ private[spark] class KubernetesClusterSchedulerBackend(
         "--hostname", "localhost",
         "--cores", "1",
         "--app-id", "1") //TODO: change app-id per application and pass from driver.
-      .withVolumeMounts()
-      .addNewVolumeMount()
-      .withName("workdir")
-      .withMountPath("/work-dir")
-      .endVolumeMount()
       .endContainer()
 
-      .withVolumes()
-      .addNewVolume()
-      .withName("workdir")
-      .withNewEmptyDir()
-      .endEmptyDir()
-      .endVolume()
       .endSpec().build()
     client.pods().inNamespace(ns).withName(podName).create(pod)
     return podName
   }
-
 
   protected def driverURL: String = {
     if (conf.contains("spark.testing")) {

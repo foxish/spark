@@ -96,27 +96,11 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     val kubernetesHost = "k8s://" + client.getMasterUrl().getHost()
     logInfo("Using as kubernetes-master: " + kubernetesHost.toString())
 
-    var annotationMap = Map("pod.beta.kubernetes.io/init-containers" -> raw"""[
-                {
-                    "name": "client-fetch",
-                    "image": "busybox",
-                    "command": ["wget", "-O", "/work-dir/client.jar", "$clientJarUri"],
-                    "volumeMounts": [
-                        {
-                            "name": "workdir",
-                            "mountPath": "/work-dir"
-                        }
-                    ]
-                }
-            ]""")
-
-
     val labelMap = Map("type" -> "spark-driver")
     val pod = new PodBuilder()
       .withNewMetadata()
       .withLabels(labelMap.asJava)
       .withName(driverName)
-      .withAnnotations(annotationMap.asJava)
       .endMetadata()
       .withNewSpec()
       .withRestartPolicy("OnFailure")
@@ -124,8 +108,9 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
       .withName("spark-driver")
       .withImage(sparkDriverImage)
       .withImagePullPolicy("Always")
-      .withCommand("/opt/spark/bin/spark-submit")
-      .withArgs(s"--class=${args.userClass}",
+      .withCommand(s"/opt/driver.sh")
+      .withArgs(s"$clientJarUri",
+                s"--class=${args.userClass}",
                 s"--master=$kubernetesHost",
                 s"--executor-memory=${driverDescription.mem}",
                 s"--conf=spark.executor.jar=$clientJarUri",
@@ -133,20 +118,9 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
                 s"--conf=spark.kubernetes.namespace=${getNamespace()}",
                 s"--conf=spark.kubernetes.driver.image=$sparkDriverImage",
                 s"--conf=spark.kubernetes.distribution.uri=$sparkDistUri",
-                "/work-dir/client.jar",
+                "/opt/client.jar",
                 args.userArgs.mkString(" "))
-      .withVolumeMounts()
-      .addNewVolumeMount()
-      .withName("workdir")
-      .withMountPath("/work-dir")
-      .endVolumeMount()
       .endContainer()
-      .withVolumes()
-      .addNewVolume()
-      .withName("workdir")
-      .withNewEmptyDir()
-      .endEmptyDir()
-      .endVolume()
       .endSpec()
       .build()
     client.pods().inNamespace(getNamespace()).withName(driverName).create(pod)
