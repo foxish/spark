@@ -36,15 +36,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
                                                   sc: SparkContext)
   extends CoarseGrainedSchedulerBackend(scheduler, sc.env.rpcEnv) {
 
-  //val config = new ConfigBuilder().withMasterUrl("https://kubernetes").build
-
-  val sparkMaster = new java.net.URI(sc.conf.get("spark.master"))
-  val client = if (sparkMaster.getHost() == "default") {
-    new DefaultKubernetesClient()
-  } else {
-    val config = new ConfigBuilder().withMasterUrl(sparkMaster.getHost()).build
-    new DefaultKubernetesClient(config)
-  }
+  val client = new DefaultKubernetesClient()
 
   val DEFAULT_NUMBER_EXECUTORS = 2
   val sparkExecutorName = s"spark-executor-${Random.alphanumeric take 5 mkString("")}".toLowerCase()
