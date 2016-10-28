@@ -35,13 +35,21 @@ private[spark] class KubernetesClusterSchedulerBackend(
                                                   scheduler: TaskSchedulerImpl,
                                                   sc: SparkContext)
   extends CoarseGrainedSchedulerBackend(scheduler, sc.env.rpcEnv) {
-  val config = new ConfigBuilder().withMasterUrl("https://kubernetes").build
-  val client = new DefaultKubernetesClient(config)
+
+  //val config = new ConfigBuilder().withMasterUrl("https://kubernetes").build
+
+  val sparkMaster = new java.net.URI(sc.conf.get("spark.master"))
+  val client = if (sparkMaster.getHost() == "default") {
+    new DefaultKubernetesClient()
+  } else {
+    val config = new ConfigBuilder().withMasterUrl(sparkMaster.getHost()).build
+    new DefaultKubernetesClient(config)
+  }
+
   val DEFAULT_NUMBER_EXECUTORS = 2
   val sparkExecutorName = s"spark-executor-${Random.alphanumeric take 5 mkString("")}".toLowerCase()
   var executorPods = mutable.ArrayBuffer[String]()
 
-  val sparkDistUri = sc.getConf.get("spark.kubernetes.distribution.uri")
   val sparkDriverImage = sc.getConf.get("spark.kubernetes.driver.image")
   val clientJarUri = sc.getConf.get("spark.executor.jar")
   val ns = sc.getConf.get("spark.kubernetes.namespace")

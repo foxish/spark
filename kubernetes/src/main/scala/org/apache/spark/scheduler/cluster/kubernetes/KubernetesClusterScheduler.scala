@@ -48,7 +48,7 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
   var client = setupKubernetesClient()
   val driverName = s"spark-driver-${Random.alphanumeric take 5 mkString("")}".toLowerCase()
   val svcName = s"spark-svc-${Random.alphanumeric take 5 mkString("")}".toLowerCase()
-  val instances = conf.get(EXECUTOR_INSTANCES).getOrElse(2) //TODO: default 2???
+  val instances = conf.get(EXECUTOR_INSTANCES).getOrElse(1)
 
   logWarning("instances: " +  instances)
 
@@ -70,12 +70,6 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     logInfo("Starting spark driver on kubernetes cluster")
     val driverDescription = buildDriverDescription(args)
 
-    // This is the URL of the spark distro.
-    val sparkDistUri = Option(System.getenv("SPARK_DISTRO_URI")).getOrElse {
-      throw new SparkException("Spark distribution not set, please set the SPARK_DISTRO_URI environment variable to " +
-        "a runnable spark archive.")
-    }
-
     // This is the URL of the driver pod's image.
     // Any image may be supplied as long as it contains a
     // ./install.sh file which is executable and sets up the
@@ -90,7 +84,6 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     conf.setExecutorEnv("spark.executor.jar", clientJarUri)
     conf.setExecutorEnv("spark.kubernetes.namespace", getNamespace())
     conf.setExecutorEnv("spark.kubernetes.driver.image", sparkDriverImage)
-    conf.setExecutorEnv("spark.kubernetes.distribution.uri", sparkDistUri)
 
     // This is the kubernetes master we're launching on.
     val kubernetesHost = "k8s://" + client.getMasterUrl().getHost()
@@ -117,7 +110,6 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
                 s"--conf=spark.executor.instances=$instances",
                 s"--conf=spark.kubernetes.namespace=${getNamespace()}",
                 s"--conf=spark.kubernetes.driver.image=$sparkDriverImage",
-                s"--conf=spark.kubernetes.distribution.uri=$sparkDistUri",
                 "/opt/client.jar",
                 args.userArgs.mkString(" "))
       .endContainer()
