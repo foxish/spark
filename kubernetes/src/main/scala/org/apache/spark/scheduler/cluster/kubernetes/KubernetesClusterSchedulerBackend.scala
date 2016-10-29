@@ -109,7 +109,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
       .addNewContainer().withName("spark-executor").withImage(sparkDriverImage)
       .withImagePullPolicy("IfNotPresent")
-      .withCommand("/opt/spark/bin/spark-class")
+      .withCommand("/opt/executor.sh")
       .withArgs("org.apache.spark.executor.CoarseGrainedExecutorBackend",
         "--driver-url", s"$driverURL",
         "--executor-id", s"$executorNum",
