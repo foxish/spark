@@ -50,6 +50,7 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
   val svcName = s"spark-svc-${Random.alphanumeric take 5 mkString("")}".toLowerCase()
   val instances = conf.get(EXECUTOR_INSTANCES).getOrElse(1)
   val serviceAccountName = conf.get("spark.kubernetes.serviceAccountName", "default")
+  val nameSpace = conf.get("spark.kubernetes.namespace", "default")
 
   logWarning("instances: " +  instances)
 
@@ -58,10 +59,10 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
   }
 
   def stop(): Unit = {
-    client.pods().inNamespace(getNamespace()).withName(driverName).delete()
+    client.pods().inNamespace(nameSpace).withName(driverName).delete()
     client
       .services()
-      .inNamespace(getNamespace())
+      .inNamespace(nameSpace)
       .withName(svcName)
       .delete()
   }
@@ -80,7 +81,7 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     // This is the URL of the client jar.
     val clientJarUri = args.userJar
     conf.setExecutorEnv("spark.executor.jar", clientJarUri)
-    conf.setExecutorEnv("spark.kubernetes.namespace", getNamespace())
+    conf.setExecutorEnv("spark.kubernetes.namespace", nameSpace)
     conf.setExecutorEnv("spark.kubernetes.driver.image", sparkDriverImage)
 
     // This is the kubernetes master we're launching on.
@@ -107,14 +108,14 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
                 s"--executor-memory=${driverDescription.mem}",
                 s"--conf=spark.executor.jar=$clientJarUri",
                 s"--conf=spark.executor.instances=$instances",
-                s"--conf=spark.kubernetes.namespace=${getNamespace()}",
+                s"--conf=spark.kubernetes.namespace=$nameSpace",
                 s"--conf=spark.kubernetes.driver.image=$sparkDriverImage",
                 "/opt/client.jar",
                 args.userArgs.mkString(" "))
       .endContainer()
       .endSpec()
       .build()
-    client.pods().inNamespace(getNamespace()).withName(driverName).create(pod)
+    client.pods().inNamespace(nameSpace).withName(driverName).create(pod)
 
     var svc = new ServiceBuilder()
       .withNewMetadata()
@@ -135,7 +136,7 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
 
     client
       .services()
-      .inNamespace(getNamespace())
+      .inNamespace(nameSpace)
       .withName(svcName)
       .create(svc)
 
@@ -163,14 +164,6 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
         var client = new DefaultKubernetesClient(config)
         return client
       }
-  }
-
-  def getNamespace(): String = {
-    var kubernetesNamespace = System.getenv("K8S_NAMESPACE")
-    if (kubernetesNamespace == null) {
-      kubernetesNamespace = "default"
-    }
-    return kubernetesNamespace
   }
 
   private def buildDriverDescription(args: ClientArguments): KubernetesDriverDescription = {
