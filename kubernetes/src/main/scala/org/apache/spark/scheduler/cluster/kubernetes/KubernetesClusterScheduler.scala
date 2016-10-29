@@ -71,13 +71,10 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     logInfo("Starting spark driver on kubernetes cluster")
     val driverDescription = buildDriverDescription(args)
 
-    // This is the URL of the driver pod's image.
-    // Any image may be supplied as long as it contains a
-    // ./install.sh file which is executable and sets up the
-    // spark environment in /opt/spark.
-    val sparkDriverImage = Option(System.getenv("SPARK_DRIVER_IMG")).getOrElse {
-      throw new SparkException("Spark driver image not set, please set the SPARK_DRIVER_IMG environment variable to " +
-        "a spark driver image.")
+    // image needs to support shim scripts "/opt/driver.sh" and "/opt/executor.sh"
+    val sparkDriverImage = conf.getOption("spark.kubernetes.sparkImage").getOrElse {
+      // TODO: this needs to default to some standard Apache Spark image
+      throw new SparkException("Spark image not set. Please configure spark.kubernetes.sparkImage")
     }
 
     // This is the URL of the client jar.
