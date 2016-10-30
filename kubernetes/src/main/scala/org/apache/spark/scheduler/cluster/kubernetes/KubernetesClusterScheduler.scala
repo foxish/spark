@@ -110,7 +110,7 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
                 s"--conf=spark.executor.instances=$instances",
                 s"--conf=spark.kubernetes.namespace=$nameSpace",
                 s"--conf=spark.kubernetes.driver.image=$sparkDriverImage",
-                "/opt/client.jar",
+                "/opt/spark/kubernetes/client.jar",
                 args.userArgs.mkString(" "))
       .endContainer()
       .endSpec()
