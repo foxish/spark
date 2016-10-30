@@ -156,14 +156,19 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
   }
 
   def setupKubernetesClient(): KubernetesClient = {
-      val sparkMaster = new java.net.URI(conf.get("spark.master"))
-      if (sparkMaster.getHost() == "default") {
-        return new DefaultKubernetesClient()
-      } else {
-        var config = new ConfigBuilder().withMasterUrl(sparkMaster.getHost()).build
-        var client = new DefaultKubernetesClient(config)
-        return client
-      }
+    val sparkHost = new java.net.URI(conf.get("spark.master")).getHost()
+
+    var config = new ConfigBuilder().withNamespace(nameSpace)
+    if (sparkHost != "default") {
+      config = config.withMasterUrl(sparkHost)
+    }
+
+    // TODO: support k8s user and password options:
+    // .withTrustCerts(true)
+    // .withUsername("admin")
+    // .withPassword("admin")
+
+    new DefaultKubernetesClient(config.build())
   }
 
   private def buildDriverDescription(args: ClientArguments): KubernetesDriverDescription = {
