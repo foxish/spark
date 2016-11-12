@@ -30,6 +30,7 @@ import org.apache.spark.util.Utils
 
 import scala.collection.mutable
 import scala.util.Random
+import scala.concurrent.Future
 
 private[spark] class KubernetesClusterSchedulerBackend(
                                                   scheduler: TaskSchedulerImpl,
@@ -40,41 +41,73 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   val DEFAULT_NUMBER_EXECUTORS = 2
   val sparkExecutorName = s"spark-executor-${Random.alphanumeric take 5 mkString("")}".toLowerCase()
-  var executorPods = mutable.ArrayBuffer[String]()
+
+  var executorPods = mutable.ArrayBuffer.empty[String]
+  var executorID = 0
 
   val sparkDriverImage = sc.getConf.get("spark.kubernetes.driver.image")
   val clientJarUri = sc.getConf.get("spark.executor.jar")
   val ns = sc.getConf.get("spark.kubernetes.namespace")
+  val dynamicExecutors = Utils.isDynamicAllocationEnabled(sc.getConf)
+
+  // executor back-ends take their configuration this way
+  if (dynamicExecutors) {
+    sc.getConf.setExecutorEnv("spark.dynamicAllocation.enabled", "true")
+    sc.getConf.setExecutorEnv("spark.shuffle.service.enabled", "true")
+  }
 
   override def start() {
     super.start()
-    var i = 0
-    for(i <- 1 to getInitialTargetExecutorNumber(sc.conf)){
-      executorPods += createExecutorPod(i)
-    }
-    None
+    createExecutorPods(getInitialTargetExecutorNumber(sc.getConf))
   }
 
   override def stop(): Unit = {
-    for (i <- 0 to executorPods.length) {
-      client.pods().inNamespace(ns).withName(executorPods(i)).delete()
-    }
+    deleteExecutorPods(executorPods)
     super.stop()
   }
 
   // Dynamic allocation interfaces
-  override def doRequestTotalExecutors(requestedTotal: Int): scala.concurrent.Future[Boolean] = {
-    return super.doRequestTotalExecutors(requestedTotal)
+  override def doRequestTotalExecutors(requestedTotal: Int): Future[Boolean] = {
+    logInfo(s"Received doRequestTotalExecutors: $requestedTotal")
+    val delta = requestedTotal - executorPods.length
+    if (delta > 0) {
+      logInfo(s"Adding $delta new executor Pods")
+      createExecutorPods(delta)
+    } else if (delta < 0) {
+      logInfo(s"Deleting ${-delta} new executor Pods")
+      // TODO: What is an informed way to kill executors with the least (or zero) load?
+      val killList = executorPods.slice(executorPods.length + delta, executorPods.length)
+      executorPods = executorPods.take(executorPods.length + delta)
+      deleteExecutorPods(killList)
+    }
+    // TODO: are there meaningful failure modes here?
+    Future.successful(true)
   }
 
-  override def doKillExecutors(executorIds: Seq[String]): scala.concurrent.Future[Boolean] = {
-    return super.doKillExecutors(executorIds)
+  override def doKillExecutors(executorIds: Seq[String]): Future[Boolean] = {
+    // I don't see doKillExecutors being called in the kube context, so I'm leaving it
+    // stubbed out with an error message
+    logError(s"""UNIMPLEMENTED: doKillExecutors: ${executorIds.mkString(",")}""")
+    Future.successful(false)
+  }
+
+  private def createExecutorPods(n: Int) {
+    for (i <- 1 to n) {
+      executorID += 1
+      executorPods += createExecutorPod(executorID)
+    }
+  }
+
+  private def deleteExecutorPods(podNames: Seq[String]) {
+    for (pod <- podNames) {
+      client.pods().inNamespace(ns).withName(pod).delete()
+    }
   }
 
   def getInitialTargetExecutorNumber(conf: SparkConf,
                                      numExecutors: Int =
                                      DEFAULT_NUMBER_EXECUTORS): Int = {
-    if (Utils.isDynamicAllocationEnabled(conf)) {
+    if (dynamicExecutors) {
       val minNumExecutors = conf.get(DYN_ALLOCATION_MIN_EXECUTORS)
       val initialNumExecutors =
         Utils.getDynamicAllocationInitialExecutors(conf)
@@ -99,6 +132,21 @@ private[spark] class KubernetesClusterSchedulerBackend(
     // create a single k8s executor pod.
     val labelMap = Map("type" -> "spark-executor")
     val podName = s"$sparkExecutorName-$executorNum"
+
+    val submitArgs = mutable.ArrayBuffer.empty[String]
+
+    if (conf.getBoolean("spark.dynamicAllocation.enabled", false)) {
+      submitArgs ++= Vector(
+        "dynamic-executors")
+    }
+
+    submitArgs ++= Vector("org.apache.spark.executor.CoarseGrainedExecutorBackend",
+      "--driver-url", s"$driverURL",
+      "--executor-id", s"$executorNum",
+      "--hostname", "localhost",
+      "--app-id", "1", // TODO: change app-id per application and pass from driver.
+      "--cores", "1")
+
     var pod = new PodBuilder()
       .withNewMetadata()
       .withLabels(labelMap.asJava)
@@ -110,17 +158,13 @@ private[spark] class KubernetesClusterSchedulerBackend(
       .addNewContainer().withName("spark-executor").withImage(sparkDriverImage)
       .withImagePullPolicy("IfNotPresent")
       .withCommand("/opt/executor.sh")
-      .withArgs("org.apache.spark.executor.CoarseGrainedExecutorBackend",
-        "--driver-url", s"$driverURL",
-        "--executor-id", s"$executorNum",
-        "--hostname", "localhost",
-        "--cores", "1",
-        "--app-id", "1") //TODO: change app-id per application and pass from driver.
+      .withArgs(submitArgs :_*)
       .endContainer()
 
       .endSpec().build()
     client.pods().inNamespace(ns).withName(podName).create(pod)
-    return podName
+
+    podName
   }
 
   protected def driverURL: String = {
