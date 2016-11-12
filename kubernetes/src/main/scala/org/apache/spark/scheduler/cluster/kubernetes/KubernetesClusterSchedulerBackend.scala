@@ -42,7 +42,8 @@ private[spark] class KubernetesClusterSchedulerBackend(
   val DEFAULT_NUMBER_EXECUTORS = 2
   val sparkExecutorName = s"spark-executor-${Random.alphanumeric take 5 mkString("")}".toLowerCase()
 
-  var executorPods = mutable.ArrayBuffer.empty[String]
+  // key is executor id, value is pod name
+  var executorToPod = mutable.Map.empty[String, String]
   var executorID = 0
 
   val sparkDriverImage = sc.getConf.get("spark.kubernetes.driver.image")
@@ -56,51 +57,55 @@ private[spark] class KubernetesClusterSchedulerBackend(
     sc.getConf.setExecutorEnv("spark.shuffle.service.enabled", "true")
   }
 
-  override def start() {
+  override def start(): Unit = {
     super.start()
     createExecutorPods(getInitialTargetExecutorNumber(sc.getConf))
   }
 
   override def stop(): Unit = {
-    deleteExecutorPods(executorPods)
+    killExecutorPods(executorToPod.toVector)
     super.stop()
   }
 
   // Dynamic allocation interfaces
   override def doRequestTotalExecutors(requestedTotal: Int): Future[Boolean] = {
     logInfo(s"Received doRequestTotalExecutors: $requestedTotal")
-    val delta = requestedTotal - executorPods.length
+    val n = executorToPod.size
+    val delta = requestedTotal - n
     if (delta > 0) {
       logInfo(s"Adding $delta new executor Pods")
       createExecutorPods(delta)
     } else if (delta < 0) {
       logInfo(s"Deleting ${-delta} new executor Pods")
       // TODO: What is an informed way to kill executors with the least (or zero) load?
-      val killList = executorPods.slice(executorPods.length + delta, executorPods.length)
-      executorPods = executorPods.take(executorPods.length + delta)
-      deleteExecutorPods(killList)
+      val kill = executorToPod.toVector.slice(n + delta, n)
+      killExecutorPods(kill)
     }
     // TODO: are there meaningful failure modes here?
     Future.successful(true)
   }
 
   override def doKillExecutors(executorIds: Seq[String]): Future[Boolean] = {
-    // I don't see doKillExecutors being called in the kube context, so I'm leaving it
-    // stubbed out with an error message
-    logError(s"""UNIMPLEMENTED: doKillExecutors: ${executorIds.mkString(",")}""")
-    Future.successful(false)
+    logInfo(s"doKillExecutors")
+    killExecutorPods(executorIds.map { id => (id, executorToPod(id)) })
+    // TODO: send shutdown message?  take off active list?  put onto waiting que and kill
+    // pods after graceful shutdown?
+    Future.successful(true)
   }
 
   private def createExecutorPods(n: Int) {
     for (i <- 1 to n) {
       executorID += 1
-      executorPods += createExecutorPod(executorID)
+      executorToPod += ((executorID.toString, createExecutorPod(executorID)))
     }
   }
 
-  private def deleteExecutorPods(podNames: Seq[String]) {
-    for (pod <- podNames) {
-      client.pods().inNamespace(ns).withName(pod).delete()
+  private def killExecutorPods(idPodPairs: Seq[(String, String)]) {
+    for (kv <- idPodPairs) {
+      executorToPod -= kv._1
+      client.pods().inNamespace(ns).withName(kv._2).delete()
+      // TODO: send message to take off the active list?
+      // send shutdown message to executor back-end?
     }
   }
 
