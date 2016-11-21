@@ -23,6 +23,8 @@ import java.util.concurrent.atomic.AtomicLong
 
 import io.fabric8.kubernetes.client.{ConfigBuilder, DefaultKubernetesClient, KubernetesClient}
 import io.fabric8.kubernetes.api.model.{PodBuilder, ServiceBuilder}
+import io.fabric8.kubernetes.api.model.Quantity
+import io.fabric8.kubernetes.api.model.ResourceRequirementsBuilder
 import io.fabric8.kubernetes.client.dsl.LogWatch
 import org.apache.spark.deploy.Command
 import org.apache.spark.deploy.kubernetes.ClientArguments
@@ -38,6 +40,8 @@ import scala.util.Random
 private[spark] object KubernetesClusterScheduler {
   def defaultNameSpace = "default"
   def defaultServiceAccountName = "default"
+  def defaultCores = 1
+  def defaultMemory = "1g"
 }
 
 /**
@@ -45,11 +49,7 @@ private[spark] object KubernetesClusterScheduler {
   * */
 private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     extends Logging {
-  private val DEFAULT_SUPERVISE = false
-  private val DEFAULT_MEMORY = Utils.DEFAULT_DRIVER_MEM_MB // mb
-  private val DEFAULT_CORES = 1.0
-
-  logInfo("Created KubernetesClusterScheduler instance")
+  logInfo("Creating KubernetesClusterScheduler instance")
 
   var client = setupKubernetesClient()
   val driverName = s"spark-driver-${Random.alphanumeric take 5 mkString("")}".toLowerCase()
@@ -60,6 +60,12 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
   val serviceAccountName = conf.get(
     "spark.kubernetes.serviceAccountName",
     KubernetesClusterScheduler.defaultServiceAccountName)
+  val driverCores = conf.getInt(
+    "spark.driver.cores",
+     KubernetesClusterScheduler.defaultCores)
+  val driverMemory = conf.getSizeAsMb(
+    "spark.driver.memory",
+    KubernetesClusterScheduler.defaultMemory)
 
   // Anything that should either not be passed to driver config in the cluster, or
   // that is going to be explicitly managed as command argument to the driver pod
@@ -87,7 +93,6 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
   def startDriver(client: KubernetesClient,
                   args: ClientArguments): Unit = {
     logInfo("Starting spark driver on kubernetes cluster")
-    val driverDescription = buildDriverDescription(args)
 
     // image needs to support shim scripts "/opt/driver.sh" and "/opt/executor.sh"
     val sparkImage = conf.getOption("spark.kubernetes.sparkImage").getOrElse {
@@ -107,7 +112,6 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
       clientJarUri,
       s"--class=${args.userClass}",
       s"--master=$kubernetesHost",
-      s"--executor-memory=${driverDescription.mem}",
       s"--conf spark.executor.jar=$clientJarUri")
 
     submitArgs ++= conf.getAll.filter { case (name, _) => !confBlackList.contains(name) }
@@ -123,6 +127,13 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     submitArgs ++= Vector("/opt/spark/kubernetes/client.jar",
       args.userArgs.mkString(" "))
 
+    val reqs = new ResourceRequirementsBuilder()
+      .withRequests(Map(
+        "cpu" -> new Quantity(s"$driverCores"),
+        "memory" -> new Quantity(s"${driverMemory}Mi")
+        ).asJava)
+      .build()
+
     val labelMap = Map("type" -> "spark-driver")
     val pod = new PodBuilder()
       .withNewMetadata()
@@ -136,6 +147,7 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
       .withName("spark-driver")
       .withImage(sparkImage)
       .withImagePullPolicy("Always")
+      .withResources(reqs)
       .withCommand(s"/opt/driver.sh")
       .withArgs(submitArgs :_*)
       .endContainer()
@@ -195,42 +207,5 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     // .withPassword("admin")
 
     new DefaultKubernetesClient(config.build())
-  }
-
-  private def buildDriverDescription(args: ClientArguments): KubernetesDriverDescription = {
-    // Required fields, including the main class because python is not yet supported
-    val appResource = Option(args.userJar).getOrElse {
-      throw new SparkException("Application jar is missing.")
-    }
-    val mainClass = Option(args.userClass).getOrElse {
-      throw new SparkException("Main class is missing.")
-    }
-
-    // Optional fields
-    val driverExtraJavaOptions = conf.getOption("spark.driver.extraJavaOptions")
-    val driverExtraClassPath = conf.getOption("spark.driver.extraClassPath")
-    val driverExtraLibraryPath = conf.getOption("spark.driver.extraLibraryPath")
-    val superviseDriver = conf.getOption("spark.driver.supervise")
-    val driverMemory = conf.getOption("spark.driver.memory")
-    val driverCores = conf.getOption("spark.driver.cores")
-    val name = conf.getOption("spark.app.name").getOrElse("default")
-    val appArgs = args.userArgs
-
-    // Construct driver description
-    val extraClassPath = driverExtraClassPath.toSeq.flatMap(_.split(File.pathSeparator))
-    val extraLibraryPath = driverExtraLibraryPath.toSeq.flatMap(_.split(File.pathSeparator))
-    val extraJavaOpts = driverExtraJavaOptions.map(Utils.splitCommandString).getOrElse(Seq.empty)
-    val sparkJavaOpts = Utils.sparkJavaOpts(conf)
-    val javaOpts = sparkJavaOpts ++ extraJavaOpts
-    val command = new Command(
-      mainClass, appArgs, null, extraClassPath, extraLibraryPath, javaOpts)
-    val actualSuperviseDriver = superviseDriver.map(_.toBoolean).getOrElse(DEFAULT_SUPERVISE)
-    val actualDriverMemory = driverMemory.map(Utils.memoryStringToMb).getOrElse(DEFAULT_MEMORY)
-    val actualDriverCores = driverCores.map(_.toDouble).getOrElse(DEFAULT_CORES)
-    val submitDate = new Date()
-
-    new KubernetesDriverDescription(
-      name, appResource, actualDriverMemory, actualDriverCores, actualSuperviseDriver,
-      command, submitDate)
   }
 }

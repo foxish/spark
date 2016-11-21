@@ -20,6 +20,8 @@ package org.apache.spark.scheduler.cluster.kubernetes
 import collection.JavaConverters._
 import io.fabric8.kubernetes.api.model.PodBuilder
 import io.fabric8.kubernetes.api.model.extensions.JobBuilder
+import io.fabric8.kubernetes.api.model.Quantity
+import io.fabric8.kubernetes.api.model.ResourceRequirementsBuilder
 import io.fabric8.kubernetes.client.{ConfigBuilder, DefaultKubernetesClient}
 import org.apache.spark.internal.config._
 import org.apache.spark.scheduler._
@@ -55,13 +57,21 @@ private[spark] class KubernetesClusterSchedulerBackend(
   val ns = conf.get(
     "spark.kubernetes.namespace",
     KubernetesClusterScheduler.defaultNameSpace)
-  val dynamicExecutors = Utils.isDynamicAllocationEnabled(conf)
+  val executorCores = conf.getInt(
+    "spark.executor.cores",
+     KubernetesClusterScheduler.defaultCores)
+  val executorMemory = conf.getSizeAsMb(
+    "spark.executor.memory",
+    KubernetesClusterScheduler.defaultMemory)
 
   // executor back-ends take their configuration this way
+  val dynamicExecutors = Utils.isDynamicAllocationEnabled(conf)
   if (dynamicExecutors) {
     conf.setExecutorEnv("spark.dynamicAllocation.enabled", "true")
     conf.setExecutorEnv("spark.shuffle.service.enabled", "true")
   }
+  conf.setExecutorEnv("spark.executor.cores", s"$executorCores")
+  conf.setExecutorEnv("spark.executor.memory", s"${executorMemory}m")
 
   override def start(): Unit = {
     super.start()
@@ -182,7 +192,14 @@ private[spark] class KubernetesClusterSchedulerBackend(
       "--executor-id", s"$executorNum",
       "--hostname", "localhost",
       "--app-id", "1", // TODO: change app-id per application and pass from driver.
-      "--cores", "1")
+      "--cores", s"$executorCores")
+
+    val reqs = new ResourceRequirementsBuilder()
+      .withRequests(Map(
+        "cpu" -> new Quantity(s"$executorCores"),
+        "memory" -> new Quantity(s"${executorMemory}Mi")
+        ).asJava)
+      .build()
 
     var pod = new PodBuilder()
       .withNewMetadata()
@@ -194,6 +211,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
       .addNewContainer().withName("spark-executor").withImage(sparkImage)
       .withImagePullPolicy("IfNotPresent")
+      .withResources(reqs)
       .withCommand("/opt/executor.sh")
       .withArgs(submitArgs :_*)
       .endContainer()
