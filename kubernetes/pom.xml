@@ -42,7 +42,11 @@
     <artifactId>kubernetes-client</artifactId>
     <version>1.4.8</version>
   </dependency>
-
+  <dependency>
+    <groupId>org.json4s</groupId>
+    <artifactId>json4s-jackson_${scala.binary.version}</artifactId>
+    <version>3.2.11</version>
+  </dependency>
     <!-- Explicit listing of transitive deps that are shaded. Otherwise, odd compiler crashes. -->
   </dependencies>
 

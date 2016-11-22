@@ -1,7 +1,8 @@
-apiVersion: "kubernetes.io/v1"
-kind: SparkJob
+apiVersion: "apache.io/v1"
+kind: "SparkJob"
 metadata:
-  name: spark-driver-1924
-image: "driver-image"
-state: "completed"
-num-executors: 10
+  name: "spark-job-1"
+spec:
+  image: "driver-image"
+  state: "completed"
+  num-executors: 10
