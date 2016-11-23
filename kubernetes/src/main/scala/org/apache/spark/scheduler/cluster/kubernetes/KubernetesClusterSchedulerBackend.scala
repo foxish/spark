@@ -48,13 +48,14 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   // TODO: do these need mutex guarding?
   // key is executor id, value is pod name
-  var executorToPod = mutable.Map.empty[String, String] // active executors
-  var shutdownToPod = mutable.Map.empty[String, String] // pending shutdown
+  val pendingToPod = mutable.Map.empty[String, String] // pending startup
+  val executorToPod = mutable.Map.empty[String, String] // active executors
+  val shutdownToPod = mutable.Map.empty[String, String] // pending shutdown
   var executorID = 0
 
   val sparkImage = conf.get("spark.kubernetes.sparkImage")
   val clientJarUri = conf.get("spark.executor.jar")
-  val ns = conf.get(
+  val nameSpace = conf.get(
     "spark.kubernetes.namespace",
     KubernetesClusterScheduler.defaultNameSpace)
   val executorCores = conf.getInt(
@@ -80,6 +81,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   override def stop(): Unit = {
     // Kill all executor pods indiscriminately
+    killExecutorPods(pendingToPod.toVector)
     killExecutorPods(executorToPod.toVector)
     killExecutorPods(shutdownToPod.toVector)
     super.stop()
@@ -147,13 +149,20 @@ private[spark] class KubernetesClusterSchedulerBackend(
   private def killExecutorPods(idPodPairs: Seq[(String, String)]) {
     for ((id, pod) <- idPodPairs) {
       try {
-        client.pods().inNamespace(ns).withName(pod).delete()
+        client.pods().inNamespace(nameSpace).withName(pod).delete()
+        pendingToPod -= id
         executorToPod -= id
         shutdownToPod -= id
       } catch {
         case e: Exception => logError(s"Error killing executor pod $pod", e)
       }
     }
+  }
+
+  def checkPending {
+    //val t: Int = client.pods().inNamespace(nameSpace).withName("eje").get().getStatus().getPhase()
+    val podStatus = pendingToPod.toVector.map { case (id, pod) =>
+      (id, pod, client.pods().inNamespace(nameSpace).withName(pod).get().getStatus()) }
   }
 
   def getInitialTargetExecutorNumber(conf: SparkConf,
@@ -217,7 +226,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
       .endContainer()
 
       .endSpec().build()
-    client.pods().inNamespace(ns).withName(podName).create(pod)
+    client.pods().inNamespace(nameSpace).withName(podName).create(pod)
 
     podName
   }
