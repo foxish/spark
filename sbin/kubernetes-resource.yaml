@@ -1,5 +1,5 @@
 metadata:
-  name: spark-job.kubernetes.io
+  name: spark-job.apache.io
   labels:
     resource: spark-job
     object: spark

@@ -55,31 +55,34 @@ private[spark] class ClientArguments(args: Array[String]) {
           args = tail
 
         case Nil =>
-
         case _ =>
           throw new IllegalArgumentException(getUsageMessage(args))
       }
     }
 
     if (primaryPyFile != null && primaryRFile != null) {
-      throw new IllegalArgumentException("Cannot have primary-py-file and primary-r-file" +
-        " at the same time")
+      throw new IllegalArgumentException(
+        "Cannot have primary-py-file and primary-r-file" +
+          " at the same time")
     }
   }
 
   private def getUsageMessage(unknownParam: List[String] = null): String = {
-    val message = if (unknownParam != null) s"Unknown/unsupported param $unknownParam\n" else ""
+    val message =
+      if (unknownParam != null) s"Unknown/unsupported param $unknownParam\n"
+      else ""
     message +
       s"""
          |Usage: org.apache.spark.deploy.kubernetes.Client [options]
          |Options:
-         |  --jar JAR_PATH           Path to your application's JAR file (required in kubernetes-cluster
-         |                           mode)
+         |  --jar JAR_PATH           Path to your application's JAR file (required in
+         |                           kubernetes-cluster mode)
          |  --class CLASS_NAME       Name of your application's main class (required)
          |  --primary-py-file        A main Python file
          |  --primary-r-file         A main R file
          |  --arg ARG                Argument to be passed to your application's main class.
-         |                           Multiple invocations are possible, each will be passed in order.
+         |                           Multiple invocations are possible, each will be passed in
+         |                           order.
       """.stripMargin
   }
 }
