@@ -17,17 +17,20 @@
 
 package org.apache.spark.scheduler.cluster.kubernetes
 
+import java.util.concurrent.Executors
+
 import scala.collection.{concurrent, mutable}
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.Future
-import scala.util.Random
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Failure, Random, Success, Try}
 
 import io.fabric8.kubernetes.api.model.{Pod, PodBuilder, PodFluent}
 import io.fabric8.kubernetes.client.DefaultKubernetesClient
 
 import org.apache.spark.{SparkConf, SparkContext, SparkException}
 import org.apache.spark.deploy.kubernetes.SparkJobResource
+import org.apache.spark.deploy.kubernetes.SparkJobResource.WatchObject
 import org.apache.spark.internal.config._
 import org.apache.spark.rpc.RpcEndpointAddress
 import org.apache.spark.scheduler._
@@ -42,8 +45,8 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   private val client = new DefaultKubernetesClient()
 
-  val DEFAULT_NUMBER_EXECUTORS = 2
-  val podPrefix = s"spark-executor-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
+  private val DEFAULT_NUMBER_EXECUTORS = 2
+  private val podPrefix = s"spark-executor-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
 
   // using a concurrent TrieMap gets rid of possible concurrency issues
   // key is executor id, value is pod name
@@ -51,13 +54,17 @@ private[spark] class KubernetesClusterSchedulerBackend(
   private var shutdownToPod = new concurrent.TrieMap[String, String] // pending shutdown
   private var executorID = 0
 
-  val sparkImage = conf.get("spark.kubernetes.sparkImage")
-  val clientJarUri = conf.get("spark.executor.jar")
-  val ns = conf.get(
+  private val sparkImage = conf.get("spark.kubernetes.sparkImage")
+  private val clientJarUri = conf.get("spark.executor.jar")
+  private val ns = conf.get(
     "spark.kubernetes.namespace",
     KubernetesClusterScheduler.defaultNameSpace)
-  val dynamicExecutors = Utils.isDynamicAllocationEnabled(conf)
-  val sparkJobResource = new SparkJobResource(client)
+  private val dynamicExecutors = Utils.isDynamicAllocationEnabled(conf)
+
+  private val executorService = Executors.newFixedThreadPool(4)
+  private implicit val executionContext = ExecutionContext.fromExecutorService(executorService)
+
+  private val sparkJobResource = new SparkJobResource(client)(executionContext)
 
   private val imagePullSecret = System.getProperty("SPARK_IMAGE_PULLSECRET", "")
 
@@ -72,16 +79,26 @@ private[spark] class KubernetesClusterSchedulerBackend(
     val keyValuePairs = Map("num-executors" -> getInitialTargetExecutorNumber(sc.conf),
       "image" -> sparkImage,
       "state" -> JobState.SUBMITTED)
-    try {
-      logInfo(s"Creating Job Resource with name. $podPrefix")
-      sparkJobResource.createJobObject(podPrefix, keyValuePairs)
-    } catch {
-      case e: SparkException =>
+    logInfo(s"Creating Job Resource with name. $podPrefix")
+
+    Try(sparkJobResource.createJobObject(podPrefix, keyValuePairs)) match {
+      case Success(_) => startWatcher()
+      case Failure(e: SparkException) =>
         logWarning(s"SparkJob object not created. ${e.getMessage}")
       // SparkJob should continue if this fails as discussed on thread.
       // TODO: we should short-circuit on things like update or delete
     }
     createExecutorPods(getInitialTargetExecutorNumber(sc.getConf))
+  }
+
+  private def startWatcher(): Unit = {
+    sparkJobResource.watchJobObject() onComplete {
+      case Success(w: WatchObject) if w.`type` == "DELETED" =>
+        logInfo("TPR Object deleted. Cleaning up")
+        stop()
+      case Success(_: WatchObject) => throw new SparkException("Unexpected response received")
+      case Failure(e: Throwable) => throw new SparkException(e.getMessage)
+    }
   }
 
   override def stop(): Unit = {
@@ -138,7 +155,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
   }
 
   private def createExecutorPods(n: Int) {
-    for (i <- 1 to n) {
+    for (_ <- 1 to n) {
       executorID += 1
       executorToPod += ((executorID.toString, createExecutorPod(executorID)))
     }

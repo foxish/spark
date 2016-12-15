@@ -49,19 +49,19 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
   private val DEFAULT_CORES = 1.0
 
   logInfo("Created KubernetesClusterScheduler instance")
-  val client = setupKubernetesClient()
-  val driverName = s"spark-driver-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
-  val svcName = s"spark-svc-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
-  val nameSpace = conf.get(
+  private val client = setupKubernetesClient()
+  private val driverName = s"spark-driver-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
+  private val svcName = s"spark-svc-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
+  private val nameSpace = conf.get(
     "spark.kubernetes.namespace",
     KubernetesClusterScheduler.defaultNameSpace)
-  val serviceAccountName = conf.get(
+  private val serviceAccountName = conf.get(
     "spark.kubernetes.serviceAccountName",
     KubernetesClusterScheduler.defaultServiceAccountName)
 
   // Anything that should either not be passed to driver config in the cluster, or
   // that is going to be explicitly managed as command argument to the driver pod
-  val confBlackList = scala.collection.Set(
+  private val confBlackList = scala.collection.Set(
     "spark.master",
     "spark.app.name",
     "spark.submit.deployMode",
@@ -69,7 +69,7 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     "spark.dynamicAllocation.enabled",
     "spark.shuffle.service.enabled")
 
-  val instances = conf.get(EXECUTOR_INSTANCES).getOrElse(1)
+  private val instances = conf.get(EXECUTOR_INSTANCES).getOrElse(1)
 
   // image needs to support shim scripts "/opt/driver.sh" and "/opt/executor.sh"
   private val sparkDriverImage = conf.getOption("spark.kubernetes.sparkImage").getOrElse {

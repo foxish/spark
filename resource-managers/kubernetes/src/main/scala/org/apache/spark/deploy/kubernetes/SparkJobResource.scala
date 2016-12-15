@@ -17,8 +17,13 @@
 
 package org.apache.spark.deploy.kubernetes
 
+import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.util.{Failure, Success}
+import scala.util.control.Breaks.{break, breakable}
+
 import io.fabric8.kubernetes.client.{BaseClient, KubernetesClient}
-import okhttp3.{MediaType, OkHttpClient, Request, RequestBody}
+import okhttp3._
+import okio.{Buffer, BufferedSource}
 import org.json4s.{CustomSerializer, DefaultFormats, JString}
 import org.json4s.JsonAST.JNull
 import org.json4s.JsonDSL._
@@ -44,8 +49,10 @@ object SparkJobResource {
                            metadata: Metadata,
                            spec: Map[String, Any])
 
+  case class WatchObject(`type`: String, `object`: SparkJobState)
+
   case object JobStateSerDe
-      extends CustomSerializer[JobState](format =>
+      extends CustomSerializer[JobState](_ =>
         ({
           case JString("SUBMITTED") => JobState.SUBMITTED
           case JString("QUEUED") => JobState.QUEUED
@@ -65,15 +72,15 @@ object SparkJobResource {
         }))
 }
 
-class SparkJobResource(client: KubernetesClient) extends Logging {
+class SparkJobResource(client: KubernetesClient)(implicit ec: ExecutionContext) extends Logging {
 
   import SparkJobResource._
 
-  implicit val formats = DefaultFormats + JobStateSerDe
+  private implicit val formats = DefaultFormats + JobStateSerDe
   private val httpClient = getHttpClient(client.asInstanceOf[BaseClient])
   private val kind = "SparkJob"
   private val apiVersion = "apache.io/v1"
-  private val apiEndpoint = s"${client.getMasterUrl}apis/$apiVersion/" +
+  private val apiEndpoint = s"${client.getMasterUrl}/apis/$apiVersion/" +
       s"namespaces/${client.getNamespace}/sparkjobs"
 
   private def getHttpClient(client: BaseClient): OkHttpClient = {
@@ -86,7 +93,7 @@ class SparkJobResource(client: KubernetesClient) extends Logging {
     }
   }
 
-  /*
+  /**
    * using a Map as an argument here allows adding more info into the Object if needed
    * */
   def createJobObject(name: String, keyValuePairs: Map[String, Any]): Unit = {
@@ -97,7 +104,6 @@ class SparkJobResource(client: KubernetesClient) extends Logging {
       .create(MediaType.parse("application/json"), compact(render(payload)))
     val request =
       new Request.Builder().post(requestBody).url(apiEndpoint).build()
-
     val response = httpClient.newCall(request).execute()
     if (response.code() == 201) {
       logInfo(
@@ -140,7 +146,7 @@ class SparkJobResource(client: KubernetesClient) extends Logging {
       logInfo(s"Successfully deleted resource $name")
     } else {
       val msg =
-        s"Failed to delete resource $name. ${response.message()}. ${request}"
+        s"Failed to delete resource $name. ${response.message()}. $request"
       logError(msg)
       throw new SparkException(msg)
     }
@@ -158,6 +164,62 @@ class SparkJobResource(client: KubernetesClient) extends Logging {
       logError(msg)
       throw new SparkException(msg)
     }
+  }
+
+  /**
+   * This method has an helper method that blocks to watch the object.
+   * The future is completed on a Delete event.
+   */
+  def watchJobObject(): Future[WatchObject] = {
+    val promiseWatchOver = Promise[WatchObject]()
+    val request =
+      new Request.Builder().get().url(s"$apiEndpoint?watch=true").build()
+    httpClient.newCall(request).execute() match {
+      case r: Response if r.code() == 200 =>
+        val deleteWatch = watchJobObjectUtil(r)
+        logInfo("Starting watch on object")
+        deleteWatch onComplete {
+          case Success(w: WatchObject) => promiseWatchOver success w
+          case Success(_) => throw new SparkException("Unexpected Response received")
+          case Failure(e: Throwable) => throw new SparkException(e.getMessage)
+        }
+      case _: Response => throw new IllegalStateException("There's fire on the mountain")
+    }
+    promiseWatchOver.future
+  }
+
+  /**
+   * This method has a blocking call inside it.
+   * However it is wrapped in a future, so it'll take off in another thread
+   */
+  private def watchJobObjectUtil(response: Response): Future[WatchObject] = {
+    val promiseOfJobState = Promise[WatchObject]()
+    val buffer = new Buffer()
+    val source: BufferedSource = response.body().source()
+    Future {
+      breakable {
+        // This will block until there are bytes to read or the source is definitely exhausted.
+        while (!source.exhausted()) {
+          source.read(buffer, 8192) match {
+            case -1 => cleanUpListener(source, buffer, response)
+            case _ => val wo = read[WatchObject](buffer.readUtf8())
+              wo match {
+                case WatchObject("DELETED", _) => promiseOfJobState success wo
+                  cleanUpListener(source, buffer, response)
+                case WatchObject(_, _) =>
+              }
+          }
+        }
+      }
+    }
+    promiseOfJobState.future
+  }
+
+  private def cleanUpListener(source: BufferedSource, buffer: Buffer, response: Response): Unit = {
+    buffer.close()
+    source.close()
+    response.close()
+    break()
   }
 
 }
