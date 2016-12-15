@@ -46,6 +46,7 @@ private[spark] class Client(val args: ClientArguments,
     shutdownLatch.countDown()
     System.clearProperty("SPARK_KUBERNETES_MODE")
     System.clearProperty("SPARK_IMAGE_PULLSECRET")
+    System.clearProperty("SPARK_JOB_OBJECT_NAME")
   }
 
   def awaitShutdown(): Unit = {

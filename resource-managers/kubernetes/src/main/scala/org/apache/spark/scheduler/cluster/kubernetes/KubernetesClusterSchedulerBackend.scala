@@ -46,7 +46,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
   private val client = new DefaultKubernetesClient()
 
   private val DEFAULT_NUMBER_EXECUTORS = 2
-  private val podPrefix = s"spark-executor-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
+  private val jobObjectName = System.getProperty("SPARK_JOB_OBJECT_NAME", "")
 
   // using a concurrent TrieMap gets rid of possible concurrency issues
   // key is executor id, value is pod name
@@ -55,13 +55,12 @@ private[spark] class KubernetesClusterSchedulerBackend(
   private var executorID = 0
 
   private val sparkImage = conf.get("spark.kubernetes.sparkImage")
-  private val clientJarUri = conf.get("spark.executor.jar")
   private val ns = conf.get(
     "spark.kubernetes.namespace",
     KubernetesClusterScheduler.defaultNameSpace)
   private val dynamicExecutors = Utils.isDynamicAllocationEnabled(conf)
 
-  private val executorService = Executors.newFixedThreadPool(4)
+  private val executorService = Executors.newFixedThreadPool(4) // why 4 ?!
   private implicit val executionContext = ExecutionContext.fromExecutorService(executorService)
 
   private val sparkJobResource = new SparkJobResource(client)(executionContext)
@@ -76,15 +75,12 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   override def start(): Unit = {
     super.start()
-    val keyValuePairs = Map("num-executors" -> getInitialTargetExecutorNumber(sc.conf),
-      "image" -> sparkImage,
-      "state" -> JobState.SUBMITTED)
-    logInfo(s"Creating Job Resource with name. $podPrefix")
-
-    Try(sparkJobResource.createJobObject(podPrefix, keyValuePairs)) match {
+    logInfo(s"Updating Job Resource with name. $jobObjectName")
+    Try(sparkJobResource
+      .updateJobObject(jobObjectName, JobState.SUBMITTED.toString, "/spec/state")) match {
       case Success(_) => startWatcher()
       case Failure(e: SparkException) =>
-        logWarning(s"SparkJob object not created. ${e.getMessage}")
+        logWarning(s"SparkJob object not updated. ${e.getMessage}")
       // SparkJob should continue if this fails as discussed on thread.
       // TODO: we should short-circuit on things like update or delete
     }
@@ -107,7 +103,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
     killExecutorPods(shutdownToPod.toVector)
     // TODO: pods that failed during build up due to some error are left behind.
     try{
-      sparkJobResource.deleteJobObject(podPrefix)
+      sparkJobResource.deleteJobObject(jobObjectName)
     } catch {
       case e: SparkException =>
         logWarning(s"SparkJob object not deleted. ${e.getMessage}")
@@ -139,11 +135,12 @@ private[spark] class KubernetesClusterSchedulerBackend(
     }
 
     // TODO: be smarter about when to update.
-    try {
-      sparkJobResource.updateJobObject(podPrefix, requestedTotal.toString, "/spec/num-executors")
-    } catch {
-      case e: SparkException => logWarning(s"SparkJob Object not updated. ${e.getMessage}")
+    Try(sparkJobResource
+        .updateJobObject(jobObjectName, requestedTotal.toString, "/spec/num-executors")) match {
+      case Success(_) => logInfo(s"Object with name: $jobObjectName updated successfully")
+      case Failure(e: SparkException) => logWarning(s"SparkJob Object not updated. ${e.getMessage}")
     }
+
     // TODO: are there meaningful failure modes here?
     Future.successful(true)
   }
@@ -162,7 +159,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
   }
 
   def shutdownExecutors(idPodPairs: Seq[(String, String)]) {
-    val active = getExecutorIds.toSet
+    val active = getExecutorIds().toSet
 
     // Check for any finished shutting down and kill the pods
     val shutdown = shutdownToPod.toVector.filter { case (e, _) => !active.contains(e) }
@@ -222,7 +219,8 @@ private[spark] class KubernetesClusterSchedulerBackend(
   def createExecutorPod(executorNum: Int): String = {
     // create a single k8s executor pod.
     val labelMap = Map("type" -> "spark-executor")
-    val podName = s"$podPrefix-$executorNum"
+    val executorBaseName = s"spark-executor-${Random.alphanumeric take 5 mkString ""}".toLowerCase
+    val podName = s"$executorBaseName-$executorNum"
 
     val submitArgs = mutable.ArrayBuffer.empty[String]
 
