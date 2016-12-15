@@ -24,16 +24,14 @@ import scala.util.control.Breaks.{break, breakable}
 import io.fabric8.kubernetes.client.{BaseClient, KubernetesClient}
 import okhttp3._
 import okio.{Buffer, BufferedSource}
-import org.json4s.{CustomSerializer, DefaultFormats, JString}
-import org.json4s.JsonAST.JNull
+import org.json4s.DefaultFormats
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 import org.json4s.jackson.Serialization.{read, write}
 
 import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
-import org.apache.spark.scheduler.cluster.kubernetes.JobState
-import org.apache.spark.scheduler.cluster.kubernetes.JobState._
+import org.apache.spark.scheduler.cluster.kubernetes.JobStateSerDe
 
 /*
  * Representation of a Spark Job State in Kubernetes
@@ -50,26 +48,6 @@ object SparkJobResource {
                            spec: Map[String, Any])
 
   case class WatchObject(`type`: String, `object`: SparkJobState)
-
-  case object JobStateSerDe
-      extends CustomSerializer[JobState](_ =>
-        ({
-          case JString("SUBMITTED") => JobState.SUBMITTED
-          case JString("QUEUED") => JobState.QUEUED
-          case JString("RUNNING") => JobState.RUNNING
-          case JString("FINISHED") => JobState.FINISHED
-          case JString("KILLED") => JobState.KILLED
-          case JString("FAILED") => JobState.FAILED
-          case JNull =>
-            throw new UnsupportedOperationException("No JobState Specified")
-        }, {
-          case JobState.FAILED => JString("FAILED")
-          case JobState.SUBMITTED => JString("SUBMITTED")
-          case JobState.KILLED => JString("KILLED")
-          case JobState.FINISHED => JString("FINISHED")
-          case JobState.QUEUED => JString("QUEUED")
-          case JobState.RUNNING => JString("RUNNING")
-        }))
 }
 
 class SparkJobResource(client: KubernetesClient)(implicit ec: ExecutionContext) extends Logging {
@@ -105,16 +83,14 @@ class SparkJobResource(client: KubernetesClient)(implicit ec: ExecutionContext) 
     val request =
       new Request.Builder().post(requestBody).url(apiEndpoint).build()
     val response = httpClient.newCall(request).execute()
-    if (response.code() == 201) {
-      logInfo(
-        s"Successfully posted resource $name: " +
-          s"${pretty(render(parse(write(resourceObject))))}")
-    } else {
+    if (!response.isSuccessful) {
       val msg =
         s"Failed to post resource $name. ${response.toString}. ${compact(render(payload))}"
       logError(msg)
       throw new SparkException(msg)
     }
+    logInfo(s"Successfully posted resource $name: " +
+        s"${pretty(render(parse(write(resourceObject))))}")
   }
 
   def updateJobObject(name: String, value: String, fieldPath: String): Unit = {
@@ -128,42 +104,39 @@ class SparkJobResource(client: KubernetesClient)(implicit ec: ExecutionContext) 
       .url(s"$apiEndpoint/$name")
       .build()
     val response = httpClient.newCall(request).execute()
-    if (response.code() == 200) {
-      logInfo(s"Successfully patched resource $name")
-    } else {
+    if (!response.isSuccessful) {
       val msg =
         s"Failed to patch resource $name. ${response.message()}. ${compact(render(payload))}"
       logError(msg)
       throw new SparkException(msg)
     }
+    logInfo(s"Successfully patched resource $name")
   }
 
   def deleteJobObject(name: String): Unit = {
     val request =
       new Request.Builder().delete().url(s"$apiEndpoint/$name").build()
     val response = httpClient.newCall(request).execute()
-    if (response.code() == 200) {
-      logInfo(s"Successfully deleted resource $name")
-    } else {
+    if (!response.isSuccessful) {
       val msg =
         s"Failed to delete resource $name. ${response.message()}. $request"
       logError(msg)
       throw new SparkException(msg)
     }
+    logInfo(s"Successfully deleted resource $name")
   }
 
   def getJobObject(name: String): SparkJobState = {
     val request =
       new Request.Builder().get().url(s"$apiEndpoint/$name").build()
     val response = httpClient.newCall(request).execute()
-    if (response.code() == 200) {
-      logInfo(s"Successfully retrieved resource $name")
-      read[SparkJobState](response.body().string())
-    } else {
+    if (!response.isSuccessful) {
       val msg = s"Failed to retrieve resource $name. ${response.message()}"
       logError(msg)
       throw new SparkException(msg)
     }
+    logInfo(s"Successfully retrieved resource $name")
+    read[SparkJobState](response.body().string())
   }
 
   /**
@@ -175,15 +148,20 @@ class SparkJobResource(client: KubernetesClient)(implicit ec: ExecutionContext) 
     val request =
       new Request.Builder().get().url(s"$apiEndpoint?watch=true").build()
     httpClient.newCall(request).execute() match {
-      case r: Response if r.code() == 200 =>
+      case r: Response if r.isSuccessful =>
         val deleteWatch = watchJobObjectUtil(r)
         logInfo("Starting watch on object")
         deleteWatch onComplete {
-          case Success(w: WatchObject) => promiseWatchOver success w
-          case Success(_) => throw new SparkException("Unexpected Response received")
-          case Failure(e: Throwable) => throw new SparkException(e.getMessage)
+          case Success(w: WatchObject) => promiseWatchOver trySuccess w
+          case Success(_) =>
+            promiseWatchOver tryFailure new SparkException("Unexpected Response received")
+          case Failure(e: Throwable) =>
+            promiseWatchOver tryFailure new SparkException(e.getMessage)
         }
-      case _: Response => throw new IllegalStateException("There's fire on the mountain")
+      case r: Response =>
+        val msg = s"Failed to start watch on resource ${r.code()} ${r.message()}"
+        logWarning(msg)
+        throw new SparkException(msg)
     }
     promiseWatchOver.future
   }
