@@ -17,7 +17,9 @@
 
 package org.apache.spark.deploy.kubernetes
 
-import scala.concurrent.{ExecutionContext, Future, Promise}
+import java.util.concurrent.{Executors, ThreadFactory}
+
+import scala.concurrent.{blocking, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 import scala.util.control.Breaks.{break, breakable}
 
@@ -54,12 +56,39 @@ class SparkJobResource(client: KubernetesClient)(implicit ec: ExecutionContext) 
 
   import SparkJobResource._
 
+  private lazy val blockingThreadPool = Executors.newCachedThreadPool(
+    new ThreadFactory {
+      def newThread(r: Runnable): Thread = {
+        val thread = new Thread(r)
+        thread.setDaemon(true)
+        thread
+      }
+    }
+  )
+
   private implicit val formats = DefaultFormats + JobStateSerDe
   private val httpClient = getHttpClient(client.asInstanceOf[BaseClient])
   private val kind = "SparkJob"
   private val apiVersion = "apache.io/v1"
   private val apiEndpoint = s"${client.getMasterUrl}/apis/$apiVersion/" +
       s"namespaces/${client.getNamespace}/sparkjobs"
+
+  private def executeBlocking[T](cb: => T): Future[T] = {
+    val p = Promise[T]()
+
+    blockingThreadPool.execute(
+      new Runnable {
+        override def run(): Unit = {
+          try {
+            p.trySuccess(blocking(cb))
+          } catch {
+            case e: Throwable => logError(e.getMessage)
+              p.tryFailure(e)
+          }
+        }
+      })
+    p.future
+  }
 
   private def getHttpClient(client: BaseClient): OkHttpClient = {
     val field = classOf[BaseClient].getDeclaredField("httpClient")
@@ -141,7 +170,7 @@ class SparkJobResource(client: KubernetesClient)(implicit ec: ExecutionContext) 
 
   /**
    * This method has an helper method that blocks to watch the object.
-   * The future is completed on a Delete event.
+   * The future is completed on a Delete event or source exhaustion.
    */
   def watchJobObject(): Future[WatchObject] = {
     val promiseWatchOver = Promise[WatchObject]()
@@ -167,22 +196,27 @@ class SparkJobResource(client: KubernetesClient)(implicit ec: ExecutionContext) 
   }
 
   /**
-   * This method has a blocking call inside it.
-   * However it is wrapped in a future, so it'll take off in another thread
+   * This method has a blocking call - wait on SSE - inside it.
+   * However it is sent off in a new thread
    */
   private def watchJobObjectUtil(response: Response): Future[WatchObject] = {
     val promiseOfJobState = Promise[WatchObject]()
     val buffer = new Buffer()
     val source: BufferedSource = response.body().source()
-    Future {
+
+    executeBlocking {
       breakable {
-        // This will block until there are bytes to read or the source is definitely exhausted.
+        // This will block until there are bytes to read or the source is exhausted.
         while (!source.exhausted()) {
           source.read(buffer, 8192) match {
-            case -1 => cleanUpListener(source, buffer, response)
+            case -1 =>
+              promiseOfJobState tryFailure
+                new SparkException("Source is exhausted and object state is unknown")
+              cleanUpListener(source, buffer, response)
             case _ => val wo = read[WatchObject](buffer.readUtf8())
               wo match {
-                case WatchObject("DELETED", _) => promiseOfJobState success wo
+                case WatchObject("DELETED", _) =>
+                  promiseOfJobState trySuccess wo
                   cleanUpListener(source, buffer, response)
                 case WatchObject(_, _) =>
               }
@@ -199,5 +233,4 @@ class SparkJobResource(client: KubernetesClient)(implicit ec: ExecutionContext) 
     response.close()
     break()
   }
-
 }

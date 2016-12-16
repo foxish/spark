@@ -60,12 +60,14 @@ private[spark] class KubernetesClusterSchedulerBackend(
     KubernetesClusterScheduler.defaultNameSpace)
   private val dynamicExecutors = Utils.isDynamicAllocationEnabled(conf)
 
-  private val executorService = Executors.newFixedThreadPool(4) // why 4 ?!
+  private val executorService = Executors.newCachedThreadPool()
   private implicit val executionContext = ExecutionContext.fromExecutorService(executorService)
 
   private val sparkJobResource = new SparkJobResource(client)(executionContext)
 
   private val imagePullSecret = System.getProperty("SPARK_IMAGE_PULLSECRET", "")
+
+  private var isObjectDeleted: Boolean = _
 
   // executor back-ends take their configuration this way
   if (dynamicExecutors) {
@@ -90,6 +92,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
   private def startWatcher(): Unit = {
     sparkJobResource.watchJobObject() onComplete {
       case Success(w: WatchObject) if w.`type` == "DELETED" =>
+        isObjectDeleted = true
         logInfo("TPR Object deleted. Cleaning up")
         stop()
       case Success(_: WatchObject) => throw new SparkException("Unexpected response received")
@@ -98,17 +101,24 @@ private[spark] class KubernetesClusterSchedulerBackend(
   }
 
   override def stop(): Unit = {
+    if (isObjectDeleted) {
+      stopUtil()
+    } else {
+      try {
+        sparkJobResource.deleteJobObject(jobObjectName)
+      } catch {
+        case e: SparkException =>
+          logWarning(s"SparkJob object not deleted. ${e.getMessage}")
+        // what else do we need to do here ?
+      }
+    }
+  }
+
+  private def stopUtil() = {
     // Kill all executor pods indiscriminately
     killExecutorPods(executorToPod.toVector)
     killExecutorPods(shutdownToPod.toVector)
     // TODO: pods that failed during build up due to some error are left behind.
-    try{
-      sparkJobResource.deleteJobObject(jobObjectName)
-    } catch {
-      case e: SparkException =>
-        logWarning(s"SparkJob object not deleted. ${e.getMessage}")
-      // what else do we need to do here ?
-    }
     super.stop()
   }
 
