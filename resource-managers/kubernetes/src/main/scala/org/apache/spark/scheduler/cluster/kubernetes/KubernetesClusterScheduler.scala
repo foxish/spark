@@ -19,11 +19,9 @@ package org.apache.spark.scheduler.cluster.kubernetes
 
 import java.io.File
 import java.util.Date
-import java.util.concurrent.Executors
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.ExecutionContext.Implicits.global
 import scala.util.{Failure, Random, Success, Try}
 
 import io.fabric8.kubernetes.api.model.{Pod, PodBuilder, PodFluent, ServiceBuilder}
@@ -31,7 +29,7 @@ import io.fabric8.kubernetes.client.{ConfigBuilder, DefaultKubernetesClient, Kub
 
 import org.apache.spark.{SparkConf, SparkException}
 import org.apache.spark.deploy.Command
-import org.apache.spark.deploy.kubernetes.{ClientArguments, SparkJobResource}
+import org.apache.spark.deploy.kubernetes.{ClientArguments, SparkJobCreateResource}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.util.Utils
@@ -79,7 +77,7 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     throw new SparkException("Spark image not set. Please configure spark.kubernetes.sparkImage")
   }
 
-  private val sparkJobResource = new SparkJobResource(client)
+  private val sparkJobResource = new SparkJobCreateResource(client, nameSpace)
 
   private val imagePullSecret = conf.get("spark.kubernetes.imagePullSecret", "")
   private val isImagePullSecretSet = isSecretRunning(imagePullSecret)
@@ -87,17 +85,23 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
   logWarning("Instances: " +  instances)
 
   def start(args: ClientArguments): Unit = {
-    val sparkJobName =
-      s"spark-job-$nameSpace-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
-    System.setProperty("SPARK_JOB_OBJECT_NAME", sparkJobName)
-    val keyValuePairs = Map("num-executors" -> instances,
+    val sparkJobResourceName =
+      s"sparkJob-$nameSpace-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
+    val keyValuePairs = Map(
+      "num-executors" -> instances,
       "image" -> sparkImage,
-      "state" -> JobState.QUEUED)
+      "state" -> JobState.QUEUED,
+      "spark-driver" -> driverName,
+      "spark-svc" -> svcName)
 
-    Try(sparkJobResource.createJobObject(sparkJobName, keyValuePairs)) match {
-      case Success(_) => logInfo(s"Object with name: $sparkJobName posted to k8s successfully")
+    Try(sparkJobResource.createJobObject(sparkJobResourceName, keyValuePairs)) match {
+      case Success(_) =>
+        conf.set("spark.kubernetes.jobResourceName", sparkJobResourceName)
+        conf.set("spark.kubernetes.jobResourceSet", "true")
+        logInfo(s"Object with name: $sparkJobResourceName posted to k8s successfully")
       case Failure(e: Throwable) => // log and carry on
-        logInfo(s"Failed to post object $sparkJobName due to ${e.getMessage}")
+        conf.set("spark.kubernetes.jobResourceSet", "false")
+        logInfo(s"Failed to post object $sparkJobResourceName due to ${e.getMessage}")
     }
 
     startDriver(client, args)
@@ -121,8 +125,8 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
     val clientJarUri = args.userJar
 
     // This is the kubernetes master we're launching on.
-    val kubernetesHost = "k8s://" + client.getMasterUrl().getHost()
-    logInfo("Using as kubernetes-master: " + kubernetesHost.toString())
+    val kubernetesHost = "k8s://" + client.getMasterUrl.getHost
+    logInfo("Using as kubernetes-master: " + kubernetesHost.toString)
 
     val submitArgs = scala.collection.mutable.ArrayBuffer.empty[String]
     submitArgs ++= Vector(
@@ -134,6 +138,9 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
       s"--conf=spark.executor.instances=$instances",
       s"--conf=spark.kubernetes.namespace=$nameSpace",
       s"--conf=spark.kubernetes.sparkImage=$sparkImage")
+
+    submitArgs ++= conf.getAll.collect {
+      case (name, value) if !confBlackList.contains(name) => s"--conf $name=$value" }
 
     if (conf.getBoolean("spark.dynamicAllocation.enabled", false)) {
       submitArgs ++= Vector(
@@ -182,7 +189,8 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
        try {
          client.secrets().inNamespace(nameSpace).withName(name).get() != null
        } catch {
-         case e: KubernetesClientException => false
+         case e: KubernetesClientException => logError(e.getMessage)
+           false
            // is this enough to throw a SparkException? For now default to false
        }
      }
@@ -211,15 +219,15 @@ private[spark] class KubernetesClusterScheduler(conf: SparkConf)
 
   private def buildPodUtil(pod: PodFluent.SpecNested[PodBuilder]): Pod = {
     if (isImagePullSecretSet) {
-      System.setProperty("SPARK_IMAGE_PULLSECRET", imagePullSecret)
       pod.addNewImagePullSecret(imagePullSecret).endSpec().build()
     } else {
+      conf.remove("spark.kubernetes.imagePullSecret")
       pod.endSpec().build()
     }
   }
 
   def setupKubernetesClient(): KubernetesClient = {
-    val sparkHost = new java.net.URI(conf.get("spark.master")).getHost()
+    val sparkHost = new java.net.URI(conf.get("spark.master")).getHost
 
     var config = new ConfigBuilder().withNamespace(nameSpace)
     if (sparkHost != "default") {
