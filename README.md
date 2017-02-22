@@ -1,3 +1,6 @@
+### This fork is no longer under active development.
+### Development of Kubernetes support in Spark has moved to https://github.com/apache-spark-on-k8s/spark/
+
 # Apache Spark
 
 Spark is a fast and general cluster computing system for Big Data. It provides
