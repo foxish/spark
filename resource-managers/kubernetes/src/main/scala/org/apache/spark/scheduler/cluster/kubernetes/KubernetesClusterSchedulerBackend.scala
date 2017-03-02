@@ -20,46 +20,57 @@ package org.apache.spark.scheduler.cluster.kubernetes
 import scala.collection.{concurrent, mutable}
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.Future
-import scala.util.Random
+import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.Duration
+import scala.util.{Failure, Random, Success, Try}
 
 import io.fabric8.kubernetes.api.model.{Pod, PodBuilder, PodFluent}
 import io.fabric8.kubernetes.client.DefaultKubernetesClient
 
 import org.apache.spark.{SparkConf, SparkContext, SparkException}
-import org.apache.spark.deploy.kubernetes.SparkJobResource
+import org.apache.spark.deploy.kubernetes.SparkJobResource.WatchObject
+import org.apache.spark.deploy.kubernetes.SparkJobRUDResource
 import org.apache.spark.internal.config._
 import org.apache.spark.rpc.RpcEndpointAddress
 import org.apache.spark.scheduler._
 import org.apache.spark.scheduler.cluster._
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{ThreadUtils, Utils}
 
 private[spark] class KubernetesClusterSchedulerBackend(
-                                                        scheduler: TaskSchedulerImpl,
-                                                        sc: SparkContext)
-  extends CoarseGrainedSchedulerBackend(scheduler, sc.env.rpcEnv) {
+    scheduler: TaskSchedulerImpl,
+    sc: SparkContext) extends CoarseGrainedSchedulerBackend(scheduler, sc.env.rpcEnv) {
 
   private val client = new DefaultKubernetesClient()
 
-  val DEFAULT_NUMBER_EXECUTORS = 2
-  val podPrefix = s"spark-executor-${Random.alphanumeric take 5 mkString ""}".toLowerCase()
+  private val DEFAULT_NUMBER_EXECUTORS = 2
+  private val jobResourceName = conf.get("spark.kubernetes.jobResourceName", "")
 
   // using a concurrent TrieMap gets rid of possible concurrency issues
   // key is executor id, value is pod name
-  private var executorToPod = new concurrent.TrieMap[String, String] // active executors
-  private var shutdownToPod = new concurrent.TrieMap[String, String] // pending shutdown
-  private var executorID = 0
+  private val executorToPod = new concurrent.TrieMap[String, String] // active executors
+  private val shutdownToPod = new concurrent.TrieMap[String, String] // pending shutdown
 
-  val sparkImage = conf.get("spark.kubernetes.sparkImage")
-  val clientJarUri = conf.get("spark.executor.jar")
-  val ns = conf.get(
+  private val sparkImage = conf.get("spark.kubernetes.sparkImage")
+  private val ns = conf.get(
     "spark.kubernetes.namespace",
     KubernetesClusterScheduler.defaultNameSpace)
-  val dynamicExecutors = Utils.isDynamicAllocationEnabled(conf)
-  val sparkJobResource = new SparkJobResource(client)
+  private val dynamicExecutors = Utils.isDynamicAllocationEnabled(conf)
 
-  private val imagePullSecret = System.getProperty("SPARK_IMAGE_PULLSECRET", "")
+  private implicit val resourceWatcherPool = ExecutionContext.fromExecutorService(
+    ThreadUtils.newDaemonFixedThreadPool(2, "resource-watcher-pool"))
+
+  private val sparkJobResource = new SparkJobRUDResource(client, ns, resourceWatcherPool)
+
+  private val imagePullSecret = conf.get("spark.kubernetes.imagePullSecret", "")
+
+  private val executorBaseName =
+    s"spark-executor-${Random.alphanumeric take 5 mkString ""}".toLowerCase
+
+  private var workingWithJobResource =
+    conf.get("spark.kubernetes.jobResourceSet", "false").toBoolean
+
+  private var watcherFuture: Future[WatchObject] = _
 
   // executor back-ends take their configuration this way
   if (dynamicExecutors) {
@@ -69,34 +80,80 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   override def start(): Unit = {
     super.start()
-    val keyValuePairs = Map("num-executors" -> getInitialTargetExecutorNumber(sc.conf),
-      "image" -> sparkImage,
-      "state" -> JobState.SUBMITTED)
-    try {
-      logInfo(s"Creating Job Resource with name. $podPrefix")
-      sparkJobResource.createJobObject(podPrefix, keyValuePairs)
-    } catch {
-      case e: SparkException =>
-        logWarning(s"SparkJob object not created. ${e.getMessage}")
-      // SparkJob should continue if this fails as discussed on thread.
-      // TODO: we should short-circuit on things like update or delete
-    }
+    startLogic()
     createExecutorPods(getInitialTargetExecutorNumber(sc.getConf))
   }
 
+  private def startLogic(): Unit = {
+    if (workingWithJobResource) {
+      logInfo(s"Updating Job Resource with name. $jobResourceName")
+      Try(sparkJobResource
+        .updateJobObject(jobResourceName, JobState.SUBMITTED.toString, "/spec/state")) match {
+        case Success(_) => startWatcher()
+        case Failure(e: SparkException) if e.getMessage startsWith "404" =>
+          logWarning(s"Possible deletion of jobResource before backend start")
+          workingWithJobResource = false
+        case Failure(e: SparkException) =>
+          logWarning(s"SparkJob object not updated. ${e.getMessage}")
+        // SparkJob should continue if this fails as discussed
+        // Maybe some retry + backoff mechanism ?
+      }
+    }
+  }
+
+  private def startWatcher(): Unit = {
+    resourceWatcherPool.execute(new Runnable {
+      override def run(): Unit = {
+        watcherFuture = sparkJobResource.watchJobObject()
+        watcherFuture onComplete {
+          case Success(w: WatchObject) if w.`type` == "DELETED" =>
+            logInfo("TPR Object deleted externally. Cleaning up")
+            stopUtil()
+            // TODO: are there other todo's for a clean kill while job is running?
+          case Success(w: WatchObject) =>
+            // Log a warning just in case, but this should almost certainly never happen
+            logWarning(s"Unexpected response received. $w")
+            deleteJobResource()
+            workingWithJobResource = false
+          case Failure(e: Throwable) =>
+            logWarning(e.getMessage)
+            deleteJobResource()
+            workingWithJobResource = false // in case watcher fails early on
+        }
+      }
+    })
+  }
+
   override def stop(): Unit = {
+    if (workingWithJobResource) {
+      sparkJobResource.stopWatcher()
+      try {
+        ThreadUtils.awaitResult(watcherFuture, Duration.Inf)
+      } catch {
+        case _ : Throwable =>
+      }
+    }
+    stopUtil()
+
+  }
+
+  private def stopUtil() = {
+    resourceWatcherPool.shutdown()
     // Kill all executor pods indiscriminately
     killExecutorPods(executorToPod.toVector)
     killExecutorPods(shutdownToPod.toVector)
     // TODO: pods that failed during build up due to some error are left behind.
-    try{
-      sparkJobResource.deleteJobObject(podPrefix)
+    super.stop()
+  }
+
+  private def deleteJobResource(): Unit = {
+    try {
+      sparkJobResource.deleteJobObject(jobResourceName)
     } catch {
       case e: SparkException =>
-        logWarning(s"SparkJob object not deleted. ${e.getMessage}")
+        logError(s"SparkJob object not deleted. ${e.getMessage}")
       // what else do we need to do here ?
     }
-    super.stop()
   }
 
   // Dynamic allocation interfaces
@@ -122,11 +179,15 @@ private[spark] class KubernetesClusterSchedulerBackend(
     }
 
     // TODO: be smarter about when to update.
-    try {
-      sparkJobResource.updateJobObject(podPrefix, requestedTotal.toString, "/spec/num-executors")
-    } catch {
-      case e: SparkException => logWarning(s"SparkJob Object not updated. ${e.getMessage}")
+    if (workingWithJobResource) {
+      Try(sparkJobResource
+        .updateJobObject(jobResourceName, requestedTotal.toString, "/spec/num-executors")) match {
+        case Success(_) => logInfo(s"Object with name: $jobResourceName updated successfully")
+        case Failure(e: SparkException) =>
+          logWarning(s"SparkJob Object not updated. ${e.getMessage}")
+      }
     }
+
     // TODO: are there meaningful failure modes here?
     Future.successful(true)
   }
@@ -139,13 +200,12 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   private def createExecutorPods(n: Int) {
     for (i <- 1 to n) {
-      executorID += 1
-      executorToPod += ((executorID.toString, createExecutorPod(executorID)))
+      executorToPod += ((i.toString, createExecutorPod(i)))
     }
   }
 
   def shutdownExecutors(idPodPairs: Seq[(String, String)]) {
-    val active = getExecutorIds.toSet
+    val active = getExecutorIds().toSet
 
     // Check for any finished shutting down and kill the pods
     val shutdown = shutdownToPod.toVector.filter { case (e, _) => !active.contains(e) }
@@ -205,7 +265,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
   def createExecutorPod(executorNum: Int): String = {
     // create a single k8s executor pod.
     val labelMap = Map("type" -> "spark-executor")
-    val podName = s"$podPrefix-$executorNum"
+    val podName = s"$executorBaseName-$executorNum"
 
     val submitArgs = mutable.ArrayBuffer.empty[String]
 
